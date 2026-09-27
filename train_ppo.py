@@ -495,6 +495,12 @@ def train(
         "dd_penalty": dd_penalty,
         "risk_fraction": CFG.risk_fraction,
         "spread_price": CFG.spread_price,
+        # Data windows this model has SEEN (training + checkpoint selection).
+        # final_holdout_eval.py refuses to "reveal" a test split that overlaps them.
+        "train_start": str(train_feat.index.min()),
+        "train_end": str(train_feat.index.max()),
+        "val_start": str(val_feat.index.min()),
+        "val_end": str(val_feat.index.max()),
     }
     # If the consistency callback saved a best (eligible) checkpoint, record it +
     # its normalisation snapshot so eval/holdout use the SAME checkpoint we'd ship.
@@ -512,12 +518,11 @@ def train(
     print(f"Run info   → {info_path}")
 
     # ── Post-training equity chart: in-sample → out-of-sample ───────────────
-    print("\nRunning post-training evaluation (train / val / test) …")
     if reveal_test:
-        print("\nRunning post-training evaluation (train / val / test) â€¦")
+        print("\nRunning post-training evaluation (train / val / test) …")
         eval_splits = {"Train": train_feat, "Val": val_feat, "Test": test_feat}
     else:
-        print("\nRunning post-training evaluation (train / val only; test remains sealed) â€¦")
+        print("\nRunning post-training evaluation (train / val only; test remains sealed) …")
         eval_splits = {"Train": train_feat, "Val": val_feat}
     _post_training_eval(
         model=model,
@@ -744,6 +749,7 @@ def _promote_fold_to_production(out_dir: str, fold_k: int, subdir: str = "walk_f
         if bmv.exists():
             prod["best_model_vecnorm_path"] = str(bmv)
     prod["promoted_from_fold"] = fold_k
+    prod["validation_scheme"] = subdir
     prod["gate_passed"] = bool(gate_passed)
     (dst / "run_info.json").write_text(json.dumps(prod, indent=2))
 

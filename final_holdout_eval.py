@@ -9,7 +9,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from baselines import TrendHoldPolicyParams, evaluate_policy, make_trend_hold_policy
 from config import CFG
 from evaluate import full_report
-from model_artifacts import load_run_info, resolve_project_path, resolve_sb3_model_path
+from model_artifacts import (
+    assert_holdout_is_unseen,
+    load_run_info,
+    resolve_project_path,
+    resolve_sb3_model_path,
+)
 from train_ppo import _CaptureDoneWrapper, _slice_m1_for_decision_window, build_env, load_datasets
 
 
@@ -74,11 +79,10 @@ def _run_rl_holdout(
     return equity, trades, report
 
 
-def main(out_dir: str = "outputs/final_holdout") -> None:
+def main(out_dir: str = "outputs/final_holdout", allow_unverified: bool = False) -> None:
     print("Revealing the sealed test split and writing holdout-only artifacts.")
 
     out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
 
     _, run_info = load_run_info("models")
     model_path = resolve_sb3_model_path(run_info["model_path"], ".")
@@ -97,6 +101,9 @@ def main(out_dir: str = "outputs/final_holdout") -> None:
         print(f"Using final checkpoint from run_info.json: {model_path}")
 
     m1, feature_cols, _train_feat, _val_feat, test_feat = load_datasets()
+    # Refuse before writing anything if the model already saw the test period.
+    assert_holdout_is_unseen(run_info, test_feat.index.min(), allow_unverified=allow_unverified)
+    out_path.mkdir(parents=True, exist_ok=True)
     test_m1 = _slice_m1_for_decision_window(m1, test_feat)
 
     rl_eq, rl_trades, rl_report = _run_rl_holdout(
@@ -131,4 +138,14 @@ def main(out_dir: str = "outputs/final_holdout") -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out-dir", default="outputs/final_holdout")
+    parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="Evaluate a legacy model whose run_info.json lacks train/val window metadata.",
+    )
+    args = parser.parse_args()
+    main(out_dir=args.out_dir, allow_unverified=args.allow_unverified)
