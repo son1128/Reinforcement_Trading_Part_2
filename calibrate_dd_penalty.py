@@ -139,10 +139,18 @@ def calibrate(models_dir: str | Path = "models", grid=(0, 0.5, 1, 1.5, 2, 3, 4, 
     table = (sel.groupby(["dd_penalty", "set"]).apply(_agg).unstack("set"))
     table.columns = [f"{s}_{m}" for m, s in table.columns]
     table = table.reset_index()
+    for c in table.columns:
+        if c.endswith(("_positive", "_n", "_fallbacks")):
+            table[c] = table[c].astype(int)
 
-    # Choose on calibration folds only; ties → smaller penalty.
-    best_row = table.sort_values(["calib_mean", "dd_penalty"], ascending=[False, True]).iloc[0]
-    chosen = float(best_row["dd_penalty"])
+    # Choose on calibration folds only.  Ties with the best mean keep the
+    # default (no evidence to move); otherwise the smaller penalty wins.
+    best_mean = table["calib_mean"].max()
+    tied = table[np.isclose(table["calib_mean"], best_mean, rtol=0, atol=1e-9)]
+    if np.isclose(tied["dd_penalty"], default).any():
+        chosen = default
+    else:
+        chosen = float(tied["dd_penalty"].min())
 
     out = Path(models_dir)
     sel.to_csv(out / "dd_penalty_selections.csv", index=False)
