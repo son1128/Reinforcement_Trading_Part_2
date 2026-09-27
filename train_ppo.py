@@ -161,6 +161,15 @@ class _ConsistencyEvalCallback(BaseCallback):
     dd_penalty is in reward-units per 1% of max drawdown.  Calibrate it against
     the reward/dd magnitudes logged in eval_logs/consistency_evals.csv: too
     large and a flat, barely-trading model wins; too small and it has no effect.
+    The default (config.ProjectConfig.resolved_dd_penalty) is 1 / (100 ·
+    risk_fraction): 1% of equity = that many R, so drawdown R and return R
+    weigh the same.
+
+    Record-only test logging: with ``test_env`` set, every evaluation ALSO rolls
+    out the fold's test window and logs its metrics (test_* columns) AFTER the
+    selection decision.  Those columns never influence which checkpoint is
+    saved; they exist so calibrate_dd_penalty.py can re-score the log offline
+    for other dd_penalty values.
     """
 
     def __init__(
@@ -176,6 +185,7 @@ class _ConsistencyEvalCallback(BaseCallback):
         train_venv: VecNormalize | None = None,
         patience: int | None = None,
         min_evals: int = 0,
+        test_env: VecNormalize | None = None,
     ):
         super().__init__(verbose=verbose)
         self.train_eval_env     = train_eval_env
@@ -199,6 +209,25 @@ class _ConsistencyEvalCallback(BaseCallback):
         self._n_evals           = 0
         self._since_best        = 0
         self.stopped_early_at: int | None = None
+        self.test_env           = test_env
+
+    def _test_metrics(self) -> dict:
+        """Roll out the test window and return its metrics (record-only)."""
+        from evaluate import full_report
+        test_r, _dd, _n = self._run_one_episode(self.test_env)
+        capture = self.test_env.venv.envs[0]
+        eq = capture.saved_equity if capture.saved_equity is not None else pd.DataFrame()
+        trades = capture.saved_trades if capture.saved_trades is not None else pd.DataFrame()
+        rep = full_report(eq, trades, initial_equity=CFG.initial_equity,
+                          periods_per_year=CFG.periods_per_year)["value"].to_dict()
+        return {
+            "test_r": round(test_r, 3),
+            "test_return_pct": rep.get("total_return_pct"),
+            "test_sharpe": rep.get("sharpe_like"),
+            "test_profit_factor": rep.get("profit_factor"),
+            "test_max_dd_pct": rep.get("max_drawdown_pct"),
+            "test_n_trades": rep.get("n_trades"),
+        }
 
     def _run_one_episode(self, venv: VecNormalize) -> tuple[float, float, int]:
         """Run one deterministic episode.
@@ -258,7 +287,10 @@ class _ConsistencyEvalCallback(BaseCallback):
                    q_val=round(q_val, 3),
                    score=round(score, 3),
                    gap=round(gap, 3),
-                   eligible=eligible)
+                   eligible=eligible,
+                   train_n_trades=train_n,
+                   val_n_trades=val_n,
+                   dd_penalty=self.dd_penalty)
         self._rows.append(row)
 
         marker = ""
@@ -274,6 +306,10 @@ class _ConsistencyEvalCallback(BaseCallback):
             if self.train_venv is not None:
                 self.train_venv.save(str(self.best_model_save_path / "best_model_vecnorm.pkl"))
             marker = "  ← BEST"
+
+        # Record-only: evaluated after the selection decision above, never used by it.
+        if self.test_env is not None:
+            row.update(self._test_metrics())
 
         if self.verbose >= 1:
             flag = "" if eligible else "  (ineligible)"
@@ -337,8 +373,9 @@ def train(
     eval_freq: int = 50_000,
     # dd_penalty: reward-units subtracted per 1% of max drawdown in checkpoint
     # selection.  Higher → prefer stabler (lower-DD) models; too high selects a
-    # near-idle policy.  Calibrate against eval_logs/consistency_evals.csv.
-    dd_penalty: float = 1.0,
+    # near-idle policy.  None → CFG.resolved_dd_penalty (1 / (100·risk_fraction)).
+    # Calibrate with calibrate_dd_penalty.py.
+    dd_penalty: float | None = None,
     # ── Parallelism & device ─────────────────────────────────────────────────
     # n_envs > 1 uses SubprocVecEnv: near-linear speedup because env simulation
     # (not the network) is the bottleneck.  n_envs=4 on a quad-core CPU gives
@@ -353,6 +390,12 @@ def train(
     # Inject pre-built splits (used by train_walk_forward to train one fold).
     # When None, load the single chronological split via load_datasets().
     datasets: tuple | None = None,
+    # Record-only: also roll out the datasets' TEST window at every checkpoint
+    # evaluation and log it (never used for selection).  Only the sliding
+    # walk-forward enables this — its fold test windows are per-fold OOS, not the
+    # sealed single-split holdout.  Disables early stopping so the log covers
+    # the whole run and calibrate_dd_penalty.py can replay any dd_penalty.
+    log_test: bool = False,
 ):
     import torch
     from stable_baselines3 import PPO
@@ -364,6 +407,14 @@ def train(
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
         print(f"GPU    : {props.name}  ({props.total_memory / 1e9:.1f} GB VRAM)")
+
+    if dd_penalty is None:
+        dd_penalty = CFG.resolved_dd_penalty
+    patience = CFG.early_stop_patience
+    if log_test and patience is not None:
+        print("Checkpoint test logging on → early stopping disabled for this run "
+              "(the calibration log must cover the full run).")
+        patience = None
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     if datasets is None:
@@ -430,10 +481,21 @@ def train(
     print(f"Val              : {len(val_feat):,} bars  "
           f"{val_feat.index.min().date()} to {val_feat.index.max().date()}")
 
-    # Sync VecNorm stats to BOTH eval envs before every checkpoint evaluation.
+    test_env = None
+    if log_test and test_feat is not None and not test_feat.empty:
+        test_m1 = _slice_m1_for_decision_window(m1, test_feat)
+        test_env = VecNormalize(
+            DummyVecEnv([lambda: _CaptureDoneWrapper(
+                build_env(test_feat, test_m1, feature_cols,
+                          randomize_start=False, episode_steps=None))]),
+            norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
+        print(f"Test (log only)  : {len(test_feat):,} bars  "
+              f"{test_feat.index.min().date()} to {test_feat.index.max().date()}")
+
+    # Sync VecNorm stats to every eval env before each checkpoint evaluation.
     sync_cb = _SyncVecNormCallback(
         train_env,
-        eval_venvs=[train_eval_env, val_env],
+        eval_venvs=[train_eval_env, val_env] + ([test_env] if test_env is not None else []),
         eval_freq=eval_freq,
     )
 
@@ -449,8 +511,9 @@ def train(
         dd_penalty=dd_penalty,
         verbose=1,
         train_venv=train_env,
-        patience=CFG.early_stop_patience,
+        patience=patience,
         min_evals=CFG.early_stop_min_evals,
+        test_env=test_env,
     )
 
     # batch_size: with n_envs parallel envs each rollout collects
@@ -525,6 +588,9 @@ def train(
         "seed": seed,
         "dd_penalty": dd_penalty,
         "stopped_early_at": eval_cb.stopped_early_at,
+        "early_stop_patience": patience,
+        "early_stop_min_evals": CFG.early_stop_min_evals,
+        "checkpoint_test_logged": test_env is not None,
         "risk_fraction": CFG.risk_fraction,
         "spread_price": CFG.spread_price,
         # Data windows this model has SEEN (training + checkpoint selection).
@@ -817,7 +883,7 @@ def train_walk_forward(
     seed: int = 42,
     out_dir: str = "models",
     train_episode_steps: int = 2048,
-    dd_penalty: float = 1.0,
+    dd_penalty: float | None = None,         # None → CFG.resolved_dd_penalty
     n_envs: int = 4,                         # SubprocVecEnv workers (CPU). Each worker copies its
                                              # fold's M1 slice under Windows 'spawn'; drop to 2 if RAM-tight.
     device: str = "auto",
@@ -1066,7 +1132,7 @@ def train_sliding_walk_forward(
     out_dir: str = "models",
     train_episode_steps: int = 2048,
     target_evals_per_fold: int = 20,
-    dd_penalty: float = 0.8,
+    dd_penalty: float | None = None,        # None → CFG.resolved_dd_penalty
     n_envs: int = 4,
     device: str = "auto",
     data: tuple | None = None,
@@ -1107,6 +1173,8 @@ def train_sliding_walk_forward(
     print(f"  <= {total_timesteps:,} steps/fold × {n_folds} folds"
           f" (max_passes_per_fold={CFG.max_passes_per_fold}, early_stop_patience="
           f"{CFG.early_stop_patience}). envs={n_envs}.")
+    print(f"  dd_penalty={dd_penalty if dd_penalty is not None else CFG.resolved_dd_penalty:g}"
+          f"  checkpoint test logging={'ON (record-only)' if CFG.log_checkpoint_test else 'off'}")
     print("  Schedule (each row = retrain + 'live' test window):")
     for k, (tr, va, te) in enumerate(folds, start=1):
         print(f"    fold {k:>2}: train {tr.index.min().date()}→{tr.index.max().date()}"
@@ -1142,6 +1210,7 @@ def train_sliding_walk_forward(
             device=device,
             reveal_test=False,
             datasets=(m1, feature_cols, tr, va, te),
+            log_test=CFG.log_checkpoint_test,
         )
 
         # Evaluate the deployable (best) checkpoint on val (reference) and on the
