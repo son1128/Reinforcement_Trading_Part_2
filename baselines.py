@@ -106,6 +106,7 @@ def optimize_trend_hold_policy(
     train_weight: float = 0.4,
     val_weight: float = 0.6,
     periods_per_year: int = 252 * 24 * 12,
+    verbose: bool = True,
 ):
     import sys
     import time
@@ -113,6 +114,7 @@ def optimize_trend_hold_policy(
     if val_env_factory is None:
         val_env_factory = train_env_factory
 
+    log = print if verbose else (lambda *args, **kwargs: None)
     combos = list(product(threshold_grid, sl_idx_grid, tp_idx_grid))
     n_total = len(combos)
     rows = []
@@ -131,7 +133,7 @@ def optimize_trend_hold_policy(
         pct = done / n_total * 100
         elapsed = time.perf_counter() - t0
         eta = (elapsed / done * (n_total - done)) if done > 0 else 0.0
-        print(
+        log(
             f"  [{done:>{len(str(n_total))}}/{n_total}] {pct:5.1f}%  "
             f"thr={threshold_atr:.2f} sl={sl_idx} tp={tp_idx}  "
             f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s",
@@ -168,7 +170,7 @@ def optimize_trend_hold_policy(
         tr_pf  = train_metrics.get("profit_factor",   float("nan"))
         va_pf  = val_metrics.get("profit_factor",     float("nan"))
         marker = " ← best" if score > best_score else ""
-        print(
+        log(
             f"         score={score:+.2f}  "
             f"train_ret={tr_ret:+.1f}%  val_ret={va_ret:+.1f}%  "
             f"train_PF={tr_pf:.2f}  val_PF={va_pf:.2f}{marker}",
@@ -181,7 +183,7 @@ def optimize_trend_hold_policy(
             best_params = params
 
     total_time = time.perf_counter() - t0
-    print(f"  [{n_total}/{n_total}] 100.0%  done in {total_time:.0f}s", flush=True)
+    log(f"  [{n_total}/{n_total}] 100.0%  done in {total_time:.0f}s", flush=True)
 
     search_df = pd.DataFrame(rows).sort_values(
         ["selection_score", "val_total_return_pct", "val_profit_factor"],

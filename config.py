@@ -144,6 +144,18 @@ class ProjectConfig:
     slippage_price: float = 0.02  # XAUUSD price units per side.
     commission_per_trade: float = 0.01
 
+    # Which quote the CSV prices are: "bid", "ask", "mid", or None = infer from
+    # the file name ("_Bid_" / "_Ask_", else "mid").  Buys fill on the ask and
+    # sells on the bid, so SL/TP on shorts trigger on the ask (bid + spread).
+    price_basis: Optional[str] = None
+    # "fixed"    → spread_price for the whole history (legacy behaviour).
+    # "relative" → max(min_spread_price, price × spread_bps / 1e4): the cost
+    #              scales with the gold price, so 2003 (~$350) and 2026 (~$4000)
+    #              are not charged the same dollar spread.  Calibrate to your broker.
+    spread_mode: str = "fixed"
+    spread_bps: float = 1.0
+    min_spread_price: float = 0.10
+
     # Reward shaping.
     holding_penalty: float = 0.00002
     reward_mtm_weight: float = 0.01
@@ -162,6 +174,26 @@ class ProjectConfig:
     ppo_target_kl: Optional[float] = 0.025  # early-stop the epoch loop if policy moves too far (None disables)
     ppo_weight_decay: float = 1e-5         # L2 on the policy/value net (Adam optimizer_kwargs)
     ppo_net_arch: Tuple[int, ...] = (128, 64)  # smaller net regularises the thin signal
+
+    # ── Over-training controls ───────────────────────────────────────────────
+    # Cap each fold's budget at this many passes over its train bars (None = no
+    # cap).  E.g. 30 passes × 29 K H1 bars ≈ 0.9 M steps instead of 3 M.
+    max_passes_per_fold: Optional[float] = None
+    # Stop a run once this many consecutive checkpoint evaluations fail to find
+    # a new best eligible checkpoint (None disables).  Never triggers before
+    # early_stop_min_evals evaluations.
+    early_stop_patience: Optional[int] = 6
+    early_stop_min_evals: int = 8
+
+    # ── Robustness / significance ────────────────────────────────────────────
+    multi_seeds: Tuple[int, ...] = (42, 7, 123)   # train_ppo.train_multi_seed()
+    # Sliding walk-forward also runs the rule-based trend baseline on every
+    # fold's TEST window.  True = grid-search its params on that fold's own
+    # train/val (same information as the RL fold); False = fixed
+    # default TrendHoldPolicyParams().
+    baseline_tune_per_fold: bool = True
+    bootstrap_samples: int = 10_000
+    bootstrap_seed: int = 0
 
     # Baseline search space. Wider brackets reduce churn on noisy intraday gold.
     baseline_threshold_grid: Tuple[float, ...] = (0.3, 0.5, 0.7, 0.9)
@@ -199,6 +231,35 @@ class ProjectConfig:
                 f"Recognised values: {sorted(_TF_TO_PANDAS.keys())}"
             )
         return rule
+
+    @property
+    def resolved_price_basis(self) -> str:
+        if self.price_basis is not None:
+            return self.price_basis
+        name = Path(self.csv_path).name.lower()
+        if "_bid_" in name:
+            return "bid"
+        if "_ask_" in name:
+            return "ask"
+        return "mid"
+
+    def env_kwargs(self) -> dict:
+        """Account / execution kwargs shared by every BracketTradingEnv."""
+        return dict(
+            sl_atr_multipliers=self.sl_atr_multipliers,
+            tp_r_multipliers=self.tp_r_multipliers,
+            initial_equity=self.initial_equity,
+            risk_fraction=self.risk_fraction,
+            spread_price=self.spread_price,
+            slippage_price=self.slippage_price,
+            commission_per_trade=self.commission_per_trade,
+            holding_penalty=self.holding_penalty,
+            reward_mtm_weight=self.reward_mtm_weight,
+            price_basis=self.resolved_price_basis,
+            spread_mode=self.spread_mode,
+            spread_bps=self.spread_bps,
+            min_spread_price=self.min_spread_price,
+        )
 
     @property
     def periods_per_year(self) -> int:

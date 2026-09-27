@@ -25,6 +25,7 @@ class Position:
     sl_distance: float = 0.0
     tp_r: float = 0.0          # planned TP R-multiple (bracket choice)
     sl_atr_mult: float = 0.0   # planned SL ATR multiplier (bracket choice)
+    spread: float = 0.0        # spread (price units) locked in at entry
     bars_in_trade: int = 0
 
 
@@ -38,6 +39,20 @@ class BracketTradingEnv(gym.Env):
         direction: 0 flat/close, 1 long, 2 short
         sl bucket: ATR multiplier index
         tp bucket: R-multiple index
+
+    Execution model:
+        price_basis   which quote the OHLC data is ("bid", "ask" or "mid"). Buys
+                      execute on the ask, sells on the bid; the other side is
+                      derived by adding/subtracting the spread.
+        spread_mode   "fixed" = spread_price for all history; "relative" =
+                      max(min_spread_price, price * spread_bps / 1e4), so the
+                      cost scales with the gold price across eras.
+        SL            stop order: triggers when the EXIT-side quote touches the
+                      level, fills at the level (or at a gapped-through open)
+                      minus slippage.
+        TP            limit order: fills exactly at the level, no slippage.
+        Market orders (entry, manual/flip close, episode-end liquidation) cross
+        the spread and pay slippage.
     """
 
     metadata = {"render_modes": []}
@@ -58,6 +73,11 @@ class BracketTradingEnv(gym.Env):
         reward_mtm_weight: float = 0.01,
         max_episode_steps: Optional[int] = None,
         randomize_start: bool = False,
+        price_basis: str = "mid",
+        spread_mode: str = "fixed",
+        spread_bps: float = 1.0,
+        min_spread_price: float = 0.0,
+        liquidate_on_done: bool = True,
     ):
         super().__init__()
         self.decision_df = decision_df.dropna(subset=feature_cols + ["atr"]).copy()
@@ -75,6 +95,18 @@ class BracketTradingEnv(gym.Env):
         self.max_episode_steps = max_episode_steps or (len(self.decision_df) - 2)
 
         self.randomize_start = randomize_start
+        if price_basis not in ("bid", "ask", "mid"):
+            raise ValueError(f"price_basis must be 'bid', 'ask' or 'mid', got {price_basis!r}")
+        if spread_mode not in ("fixed", "relative"):
+            raise ValueError(f"spread_mode must be 'fixed' or 'relative', got {spread_mode!r}")
+        self.price_basis = price_basis
+        self.spread_mode = spread_mode
+        self.spread_bps = float(spread_bps)
+        self.min_spread_price = float(min_spread_price)
+        # Close any open position when the episode ends so the final equity and
+        # trade log are complete.  Training envs (random fixed-length windows)
+        # disable it: a truncation is not a real exit.
+        self.liquidate_on_done = bool(liquidate_on_done)
 
         # Pre-extract M1 high/low as contiguous numpy arrays and cache the
         # sorted DatetimeIndex for O(log n) searchsorted lookups.
@@ -154,12 +186,40 @@ class BracketTradingEnv(gym.Env):
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
         return obs
 
-    def _entry_price(self, close: float, direction: int) -> float:
-        return close + direction * (self.spread_price / 2.0 + self.slippage_price)
+    def _spread_at(self, price: float) -> float:
+        if self.spread_mode == "relative":
+            return max(self.min_spread_price, price * self.spread_bps / 1e4)
+        return self.spread_price
 
-    def _exit_price(self, price: float, direction: int) -> float:
-        # Long exits at bid below mid; short exits at ask above mid.
-        return price - direction * (self.spread_price / 2.0 + self.slippage_price)
+    def _quote_offsets(self, spread: float) -> tuple[float, float]:
+        """(buy offset, sell offset) to turn a data price into ask / bid."""
+        if self.price_basis == "bid":
+            return spread, 0.0
+        if self.price_basis == "ask":
+            return 0.0, -spread
+        return spread / 2.0, -spread / 2.0
+
+    def _exit_offset(self, p: Position) -> float:
+        """Offset from data price to the quote a position EXITS on (long sells
+        on the bid, short buys on the ask)."""
+        buy_off, sell_off = self._quote_offsets(p.spread)
+        return sell_off if p.direction == 1 else buy_off
+
+    def _entry_price(self, close: float, direction: int, spread: float) -> float:
+        buy_off, sell_off = self._quote_offsets(spread)
+        off = buy_off if direction == 1 else sell_off
+        return close + off + direction * self.slippage_price
+
+    def _market_exit_price(self, price: float) -> float:
+        p = self.position
+        return price + self._exit_offset(p) - p.direction * self.slippage_price
+
+    def _unrealized(self, price: float) -> float:
+        """Mark-to-market PnL of the open position at the exit-side quote."""
+        p = self.position
+        if p.direction == 0:
+            return 0.0
+        return (price + self._exit_offset(p) - p.entry_price) * p.units * p.direction
 
     def _open_position(self, direction: int, sl_idx: int, tp_idx: int):
         row = self._current_row()
@@ -168,7 +228,8 @@ class BracketTradingEnv(gym.Env):
         sl_atr_mult = self.sl_atr_multipliers[sl_idx]
         sl_dist = max(sl_atr_mult * atr, 1e-8)
         tp_r = self.tp_r_multipliers[tp_idx]
-        entry = self._entry_price(close, direction)
+        spread = self._spread_at(close)
+        entry = self._entry_price(close, direction, spread)
         sl = entry - direction * sl_dist
         tp = entry + direction * tp_r * sl_dist
         risk_cash = max(self.equity * self.risk_fraction, 1e-8)
@@ -185,15 +246,16 @@ class BracketTradingEnv(gym.Env):
             sl_distance=sl_dist,
             tp_r=tp_r,
             sl_atr_mult=sl_atr_mult,
+            spread=spread,
             bars_in_trade=0,
         )
 
-    def _close_position(self, exit_price_raw: float, exit_time: pd.Timestamp, reason: str,
+    def _close_position(self, exit_price: float, exit_time: pd.Timestamp, reason: str,
                         gap_fill: bool = False) -> float:
+        """Close at an already-executable price (spread/slippage applied by caller)."""
         p = self.position
         if p.direction == 0:
             return 0.0
-        exit_price = self._exit_price(exit_price_raw, p.direction)
         pnl = (exit_price - p.entry_price) * p.units * p.direction - self.commission_per_trade
         self.equity += pnl
         self.realized_pnl += pnl
@@ -236,11 +298,15 @@ class BracketTradingEnv(gym.Env):
         lo = int(self._m1_index.searchsorted(start, side="right"))
         hi = int(self._m1_index.searchsorted(end,   side="right"))
 
+        # Triggers are evaluated on the quote the position exits on.
+        off = self._exit_offset(p)
+        slip = p.direction * self.slippage_price
+
         realized = 0.0
         for idx in range(lo, hi):
-            open_ = self._m1_open[idx]
-            high = self._m1_high[idx]
-            low  = self._m1_low[idx]
+            open_ = self._m1_open[idx] + off
+            high = self._m1_high[idx] + off
+            low  = self._m1_low[idx] + off
             p = self.position
             if p.direction == 0:
                 break
@@ -249,7 +315,7 @@ class BracketTradingEnv(gym.Env):
             # gap), a stop order fills at the open, not at the SL price.
             # A TP gap is left at the TP price (no price improvement assumed).
             if (open_ - p.sl) * p.direction <= 0:
-                realized += self._close_position(open_, self._m1_index[idx], "SL", gap_fill=True)
+                realized += self._close_position(open_ - slip, self._m1_index[idx], "SL", gap_fill=True)
                 break
 
             if p.direction == 1:
@@ -261,7 +327,7 @@ class BracketTradingEnv(gym.Env):
 
             # Pessimistic intrabar rule: if both touched, assume SL first.
             if sl_hit:
-                realized += self._close_position(p.sl, self._m1_index[idx], "SL")
+                realized += self._close_position(p.sl - slip, self._m1_index[idx], "SL")
                 break
             if tp_hit:
                 realized += self._close_position(p.tp, self._m1_index[idx], "TP")
@@ -282,9 +348,9 @@ class BracketTradingEnv(gym.Env):
         if self.position.direction != 0:
             current_dir = self.position.direction
             if desired_direction == 0:
-                self._close_position(close, self._current_time(), "manual_close")
+                self._close_position(self._market_exit_price(close), self._current_time(), "manual_close")
             elif desired_direction != current_dir:
-                self._close_position(close, self._current_time(), "flip_close")
+                self._close_position(self._market_exit_price(close), self._current_time(), "flip_close")
                 self._open_position(desired_direction, sl_idx, tp_idx)
 
         # Fresh entry if flat and action wants exposure.
@@ -294,17 +360,24 @@ class BracketTradingEnv(gym.Env):
         # Simulate TP/SL using the M1 candles inside this decision interval.
         self._simulate_m1_until_next_decision()
 
-        # Dense mark-to-market reward after interval.
-        # Uses the CURRENT bar's close (known at decision time) to avoid lookahead.
-        # The primary reward is realized PnL from TP/SL hits above; this is a small
-        # shaping term (weight 0.01) that gives the agent a directional signal while
-        # the trade is open, without leaking any future price information.
+        # Everything below is measured at the END of the interval (the next
+        # decision bar's close) — the same point in time the realized PnL above
+        # refers to.  This is reward/reporting only; the observation for the
+        # next step is still built from data known at that bar's close.
+        end_time = self._next_time()
+        end_close = float(self.decision_df.iloc[min(self.i + 1, len(self.decision_df) - 1)]["Close"])
+
+        self.i += 1
+        self.steps += 1
+        terminated = self.i >= len(self.decision_df) - 2
+        truncated = self.steps >= self.max_episode_steps
+
+        if (terminated or truncated) and self.liquidate_on_done and self.position.direction != 0:
+            self._close_position(self._market_exit_price(end_close), end_time, "episode_end")
+
         if self.position.direction != 0:
             self.position.bars_in_trade += 1
-            current_close = float(self.decision_df.iloc[self.i]["Close"])
-            unrealized = (current_close - self.position.entry_price) * self.position.units * self.position.direction
-        else:
-            unrealized = 0.0
+        unrealized = self._unrealized(end_close)
 
         reward = (self.equity - prev_equity) / reward_risk_unit
         if self.position.direction != 0:
@@ -312,25 +385,23 @@ class BracketTradingEnv(gym.Env):
             reward -= self.holding_penalty
 
         self.history.append({
-            "time": self._current_time(),
-            "equity": self.equity,
+            "time": end_time,
+            "equity": self.equity + unrealized,     # mark-to-market
+            "realized_equity": self.equity,
             "realized_pnl": self.realized_pnl,
             "position": self.position.direction,
-            "close": close,
+            "close": end_close,
             "reward": reward,
         })
 
-        self.i += 1
-        self.steps += 1
-        terminated = self.i >= len(self.decision_df) - 2
-        truncated = self.steps >= self.max_episode_steps
         obs = self._observation() if not (terminated or truncated) else np.zeros(self.observation_space.shape, dtype=np.float32)
         info = {"equity": self.equity, "n_trades": len(self.trades)}
         return obs, float(reward), terminated, truncated, info
 
     def equity_curve(self) -> pd.DataFrame:
         if not self.history:
-            return pd.DataFrame(columns=["time", "equity", "realized_pnl", "position", "close", "reward"])
+            return pd.DataFrame(columns=["time", "equity", "realized_equity", "realized_pnl",
+                                         "position", "close", "reward"])
         return pd.DataFrame(self.history).set_index("time")
 
     def trade_log(self) -> pd.DataFrame:
