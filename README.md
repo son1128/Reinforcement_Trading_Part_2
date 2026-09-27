@@ -46,7 +46,8 @@ Train the RL agent with walk-forward validation (one model per fold, aggregate
 out-of-sample report; the final fold is saved as the production model):
 
 ```bash
-python train_ppo.py            # == train_ppo.train_walk_forward()
+python train_ppo.py               # == train_ppo.train_sliding_walk_forward()
+python train_ppo.py --multi-seed  # repeat it for CFG.multi_seeds → models/multi_seed/
 ```
 
 When you are ready for the one-time holdout reveal, run:
@@ -73,6 +74,11 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 - When TP and SL are both inside the same M1 candle, the simulator assumes SL first. This is deliberately pessimistic.
 - If an M1 bar **opens beyond the SL** (weekend/news gap), the stop fills at that bar's open, not at the SL price (`gap_fill=True` in the trade log). A gap through the TP still fills at the TP price (no price improvement assumed).
 - **Holdout guard:** `train_ppo.train()` records the train/val windows in `run_info.json`, and `final_holdout_eval.py` (and `training_diagnostics.py` with `reveal_test=True`) refuse to evaluate a test split the model has already seen. A sliding walk-forward promotes its last fold, whose train/val windows overlap the single-split test, so for that scheme use the per-fold TEST results and `sliding_oos_equity.csv`. Legacy `run_info.json` files without window metadata are refused unless `--allow-unverified` is passed.
+- **Execution model:** `price_basis` (`bid`/`ask`/`mid`, inferred from the file name by default) says which quote the CSV holds; buys fill on the ask and sells on the bid, so a short's SL/TP trigger on the ask. SL = stop order (fills at the level, or the gapped open, minus slippage); TP = limit order (fills at the level, no slippage). `spread_mode="relative"` charges `max(min_spread_price, price × spread_bps/1e4)` instead of a fixed dollar spread across 23 years; the default stays `"fixed"` — calibrate either to your broker.
+- **Equity is mark-to-market:** `equity` = realized + unrealized PnL at the end of each decision interval (`realized_equity` keeps the old series), so max drawdown includes open-trade losses. Evaluation episodes liquidate any open position at the end (`exit_reason="episode_end"`); training episodes (random fixed-length windows) do not. The MTM reward-shaping term also uses the interval-end close instead of the stale decision close.
+- **Over-training controls:** `max_passes_per_fold` caps each fold's timesteps at N passes over its train bars (off by default), and `early_stop_patience` stops a run after that many evaluations without a new best eligible checkpoint (never before `early_stop_min_evals`).
+- **Baseline + significance:** the sliding walk-forward also runs the trend baseline on every fold's test window (params tuned on that fold's own train/val when `baseline_tune_per_fold=True`), writes `sliding_oos_equity_baseline.csv`, and bootstrap-tests the results (`sliding_significance.csv`, `significance.py`): mean trade R > 0, daily Sharpe > 0 (moving-block bootstrap), and RL − baseline per fold (bootstrap + exact sign test).
+- **Multi-seed:** `train_ppo.train_multi_seed()` repeats the sliding walk-forward for `multi_seeds`, sharing data and the baseline, and reports the per-fold and stitched-OOS spread across seeds.
 - Position size is fixed-fractional risk-based; the RL agent controls direction and bracket shape, not size.
 - `run_pipeline.py` now performs a temporal train/validation/test split, tunes on train/val, and keeps test sealed by default.
 - `training_diagnostics.py` and `train_ppo.py` also keep the test split sealed by default.
@@ -87,6 +93,7 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 - `env_bracket.py`: Gymnasium-compatible bracket trading environment.
 - `baselines.py`: random and EMA/ATR rule policies.
 - `evaluate.py`: metrics, trade-log summary, drawdown.
+- `significance.py`: bootstrap / sign tests for out-of-sample results.
 - `visualize.py`: Plotly visualization functions.
 - `train_ppo.py`: optional PPO training scaffold.
 - `run_pipeline.py`: one-command pre-test pipeline with validation-only outputs.

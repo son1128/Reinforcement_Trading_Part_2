@@ -41,20 +41,7 @@ def _slice_m1_for_decision_window(m1_df, decision_df):
 
 
 def _make_env(decision_df, m1_df, feature_cols):
-    return BracketTradingEnv(
-        decision_df,
-        m1_df,
-        feature_cols,
-        sl_atr_multipliers=CFG.sl_atr_multipliers,
-        tp_r_multipliers=CFG.tp_r_multipliers,
-        initial_equity=CFG.initial_equity,
-        risk_fraction=CFG.risk_fraction,
-        spread_price=CFG.spread_price,
-        slippage_price=CFG.slippage_price,
-        commission_per_trade=CFG.commission_per_trade,
-        holding_penalty=CFG.holding_penalty,
-        reward_mtm_weight=CFG.reward_mtm_weight,
-    )
+    return BracketTradingEnv(decision_df, m1_df, feature_cols, **CFG.env_kwargs())
 
 
 def _scenario_rows(scenario, report_df):

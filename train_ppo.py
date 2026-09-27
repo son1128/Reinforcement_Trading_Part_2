@@ -103,17 +103,12 @@ def build_env(decision_df, m1_df, feature_cols, randomize_start: bool = False,
         decision_df,
         m1_df,
         feature_cols,
-        sl_atr_multipliers=CFG.sl_atr_multipliers,
-        tp_r_multipliers=CFG.tp_r_multipliers,
-        initial_equity=CFG.initial_equity,
-        risk_fraction=CFG.risk_fraction,
-        spread_price=CFG.spread_price,
-        slippage_price=CFG.slippage_price,
-        commission_per_trade=CFG.commission_per_trade,
-        holding_penalty=CFG.holding_penalty,
-        reward_mtm_weight=CFG.reward_mtm_weight,
+        **CFG.env_kwargs(),
         randomize_start=randomize_start,
         max_episode_steps=episode_steps,
+        # Random fixed-length training windows end by truncation, which is not a
+        # real exit; full-split evaluation episodes liquidate so equity is final.
+        liquidate_on_done=not randomize_start,
     )
     return Monitor(env)
 
@@ -179,6 +174,8 @@ class _ConsistencyEvalCallback(BaseCallback):
         min_trades: int = 5,
         verbose: int = 1,
         train_venv: VecNormalize | None = None,
+        patience: int | None = None,
+        min_evals: int = 0,
     ):
         super().__init__(verbose=verbose)
         self.train_eval_env     = train_eval_env
@@ -195,6 +192,13 @@ class _ConsistencyEvalCallback(BaseCallback):
         self.best_score         = -float("inf")
         self._last_eval         = 0
         self._rows: list[dict]  = []
+        # Early stopping: end training after `patience` consecutive evaluations
+        # without a new best eligible checkpoint (never before `min_evals`).
+        self.patience           = patience
+        self.min_evals          = int(min_evals)
+        self._n_evals           = 0
+        self._since_best        = 0
+        self.stopped_early_at: int | None = None
 
     def _run_one_episode(self, venv: VecNormalize) -> tuple[float, float, int]:
         """Run one deterministic episode.
@@ -258,7 +262,10 @@ class _ConsistencyEvalCallback(BaseCallback):
         self._rows.append(row)
 
         marker = ""
+        self._n_evals += 1
+        self._since_best += 1
         if eligible and score > self.best_score:
+            self._since_best = 0
             self.best_score = score
             self.best_model_save_path.mkdir(parents=True, exist_ok=True)
             self.model.save(str(self.best_model_save_path / "best_model"))
@@ -286,7 +293,23 @@ class _ConsistencyEvalCallback(BaseCallback):
                 self.log_path / "consistency_evals.csv", index=False
             )
 
+        if (self.patience is not None
+                and self._n_evals >= self.min_evals
+                and self._since_best >= self.patience):
+            self.stopped_early_at = self.num_timesteps
+            if self.verbose >= 1:
+                print(f"Early stop at {self.num_timesteps:,} steps: no new best checkpoint "
+                      f"in the last {self._since_best} evaluations.", flush=True)
+            return False
         return True
+
+
+def cap_timesteps(total_timesteps: int, n_train_bars: int) -> int:
+    """Apply CFG.max_passes_per_fold: at most that many passes over the train
+    bars, so a small train window is not replayed hundreds of times."""
+    if CFG.max_passes_per_fold is None or n_train_bars <= 0:
+        return int(total_timesteps)
+    return int(min(total_timesteps, round(CFG.max_passes_per_fold * n_train_bars)))
 
 
 def _linear_schedule(initial_value: float):
@@ -349,6 +372,12 @@ def train(
         m1, feature_cols, train_feat, val_feat, test_feat = datasets
     train_m1 = _slice_m1_for_decision_window(m1, train_feat)
     val_m1   = _slice_m1_for_decision_window(m1, val_feat)
+
+    capped = cap_timesteps(total_timesteps, len(train_feat))
+    if capped < total_timesteps:
+        print(f"Timesteps capped {total_timesteps:,} → {capped:,} "
+              f"(max_passes_per_fold={CFG.max_passes_per_fold:g} × {len(train_feat):,} bars)")
+        total_timesteps = capped
 
     # ── Training environments ─────────────────────────────────────────────────
     if n_envs > 1:
@@ -420,6 +449,8 @@ def train(
         dd_penalty=dd_penalty,
         verbose=1,
         train_venv=train_env,
+        patience=CFG.early_stop_patience,
+        min_evals=CFG.early_stop_min_evals,
     )
 
     # batch_size: with n_envs parallel envs each rollout collects
@@ -493,6 +524,7 @@ def train(
         "train_episode_steps": train_episode_steps,
         "seed": seed,
         "dd_penalty": dd_penalty,
+        "stopped_early_at": eval_cb.stopped_early_at,
         "risk_fraction": CFG.risk_fraction,
         "spread_price": CFG.spread_price,
         # Data windows this model has SEEN (training + checkpoint selection).
@@ -701,14 +733,15 @@ def _passes_consistency_gate(
     passed = bool(c_count and c_worst and c_sharpe)
 
     ok = lambda b: "OK  " if b else "FAIL"
+    leg = pf_col.split("_", 1)[0]           # "val" or "test"
     detail = [
         f"[{ok(c_count)}] folds with return>0 & PF>{CFG.gate_min_profit_factor:g}: "
         f"{good}/{n}  (need >= {CFG.min_consistent_folds})",
-        f"[{ok(c_worst)}] worst-fold val PF: {worst_pf:.2f}  "
+        f"[{ok(c_worst)}] worst-fold {leg} PF: {worst_pf:.2f}  "
         f"(need >= {CFG.gate_worst_fold_min_pf:g})",
     ]
     if CFG.gate_require_mean_sharpe_positive:
-        detail.append(f"[{ok(c_sharpe)}] mean val Sharpe: {mean_sharpe:+.2f}  (need > 0)")
+        detail.append(f"[{ok(c_sharpe)}] mean {leg} Sharpe: {mean_sharpe:+.2f}  (need > 0)")
     return passed, detail
 
 
@@ -815,7 +848,7 @@ def train_walk_forward(
     train_lens = [len(tr) for tr, _ in folds]
     max_len = max(train_lens)
     fold_timesteps = [
-        max(min_timesteps_per_fold, int(round(total_timesteps * L / max_len)))
+        cap_timesteps(max(min_timesteps_per_fold, int(round(total_timesteps * L / max_len))), L)
         for L in train_lens
     ]
 
@@ -932,6 +965,101 @@ def _load_fold_model(fold_dir: str):
     return model, Path(vp)
 
 
+def _load_sliding_folds():
+    """(m1, feature_cols, folds) for the sliding walk-forward (see config)."""
+    m1, feat, feature_cols = _load_decision_features()
+    folds = make_sliding_folds(
+        feat,
+        train_years=CFG.sliding_train_years,
+        val_months=CFG.sliding_val_months,
+        test_months=CFG.sliding_test_months,
+        step_months=CFG.sliding_step_months,
+        embargo_bars=CFG.split_embargo_bars,
+    )
+    if not folds:
+        raise ValueError("No sliding folds produced — not enough data for the "
+                         "chosen train/val/test window. Check CFG.sliding_* / dataset.")
+    return m1, feature_cols, folds
+
+
+def _stitch_equity(equities: list[pd.DataFrame]) -> pd.DataFrame:
+    """Chain (compound) per-fold equity curves into one continuous curve."""
+    running = CFG.initial_equity
+    parts = []
+    for eq in equities:
+        if eq is None or eq.empty or "equity" not in eq:
+            continue
+        s = eq["equity"].astype(float)
+        scaled = s / CFG.initial_equity * running
+        parts.append(scaled)
+        running = float(scaled.iloc[-1])
+    stitched = pd.concat(parts) if parts else pd.Series(dtype=float)
+    return stitched.to_frame("equity")
+
+
+def sliding_baseline(m1, feature_cols, folds, tune: bool | None = None) -> list[dict]:
+    """Run the rule-based trend baseline on every fold's TEST window.
+
+    With ``tune`` (default CFG.baseline_tune_per_fold) its parameters are
+    grid-searched on that fold's own train/val windows — the same information
+    the RL fold had — so RL vs baseline is a like-for-like comparison.  Without
+    it the fixed default TrendHoldPolicyParams() are used.  The baseline is
+    deterministic, so compute it once and reuse it across seeds.
+    """
+    from baselines import (TrendHoldPolicyParams, evaluate_policy,
+                           make_trend_hold_policy, optimize_trend_hold_policy)
+
+    tune = CFG.baseline_tune_per_fold if tune is None else tune
+
+    def _env(df):
+        return BracketTradingEnv(df, _slice_m1_for_decision_window(m1, df),
+                                 feature_cols, **CFG.env_kwargs())
+
+    out = []
+    for k, (tr, va, te) in enumerate(folds, start=1):
+        if tune:
+            params, _ = optimize_trend_hold_policy(
+                lambda tr=tr: _env(tr),
+                threshold_grid=CFG.baseline_threshold_grid,
+                sl_idx_grid=CFG.baseline_sl_idx_grid,
+                tp_idx_grid=CFG.baseline_tp_idx_grid,
+                initial_equity=CFG.initial_equity,
+                val_env_factory=lambda va=va: _env(va),
+                periods_per_year=CFG.periods_per_year,
+                verbose=False,
+            )
+        else:
+            params = TrendHoldPolicyParams()
+        eq, trades, rep = evaluate_policy(_env(te), make_trend_hold_policy(params),
+                                          initial_equity=CFG.initial_equity,
+                                          periods_per_year=CFG.periods_per_year)
+        out.append({"params": params, "equity": eq, "trades": trades,
+                    "report": rep["value"].to_dict()})
+        print(f"   baseline fold {k:>2}: {params}  TEST return="
+              f"{out[-1]['report'].get('total_return_pct'):+.1f}%", flush=True)
+    return out
+
+
+def _significance_report(rl_eq, rl_trades, base_eq, base_trades, summary) -> pd.DataFrame:
+    """Bootstrap RL vs baseline on the stitched OOS track records."""
+    from significance import (block_sharpe_test, daily_returns,
+                              paired_fold_test, trade_mean_r_test)
+
+    kw = dict(n_boot=CFG.bootstrap_samples, seed=CFG.bootstrap_seed)
+    rows = []
+    for name, eq, trades in (("rl", rl_eq, rl_trades), ("baseline", base_eq, base_trades)):
+        r = trade_mean_r_test(trades["r_mult"] if trades is not None and not trades.empty else [], **kw)
+        rows.append({"test": f"{name}_mean_trade_R>0", "stat": r["mean_r"], **r})
+        s = block_sharpe_test(daily_returns(eq), periods_per_year=261, block_len=5, **kw)
+        rows.append({"test": f"{name}_daily_sharpe>0", "stat": s["sharpe"], **s})
+    for col in ("test_return_pct", "test_sharpe"):
+        base_col = f"baseline_{col}"
+        if base_col in summary:
+            d = paired_fold_test(summary[col], summary[base_col], **kw)
+            rows.append({"test": f"rl_minus_baseline_{col}>0", "stat": d["mean_diff"], **d})
+    return pd.DataFrame(rows)
+
+
 def train_sliding_walk_forward(
     total_timesteps: int = 3_000_000,
     seed: int = 42,
@@ -941,6 +1069,9 @@ def train_sliding_walk_forward(
     dd_penalty: float = 0.8,
     n_envs: int = 4,
     device: str = "auto",
+    data: tuple | None = None,
+    baseline: list[dict] | None = None,
+    compare_baseline: bool = True,
 ):
     """Sliding-window walk-forward that simulates periodic retraining.
 
@@ -956,31 +1087,26 @@ def train_sliding_walk_forward(
     aggregate are computed on the TEST metrics (the honest ones), and the final
     (most recent) fold is the deployable model.
 
-    Per-fold timesteps are fixed because every train window is the same calendar
-    length, so equal timesteps already means equal passes over the data.
+    With ``compare_baseline`` the rule-based trend baseline is run on the same
+    test windows (``sliding_baseline``), stitched the same way, and RL vs
+    baseline is bootstrap-tested (``sliding_significance.csv``).
+
+    ``data`` = (m1, feature_cols, folds) and ``baseline`` let train_multi_seed()
+    reuse the loaded data and the deterministic baseline across seeds.  The
+    returned summary carries the stitched OOS metrics in ``summary.attrs``.
     """
     from evaluate import full_report
 
-    m1, feat, feature_cols = _load_decision_features()
-    folds = make_sliding_folds(
-        feat,
-        train_years=CFG.sliding_train_years,
-        val_months=CFG.sliding_val_months,
-        test_months=CFG.sliding_test_months,
-        step_months=CFG.sliding_step_months,
-        embargo_bars=CFG.split_embargo_bars,
-    )
+    m1, feature_cols, folds = data if data is not None else _load_sliding_folds()
     n_folds = len(folds)
-    if n_folds == 0:
-        raise ValueError("No sliding folds produced — not enough data for the "
-                         "chosen train/val/test window. Check CFG.sliding_* / dataset.")
 
     print("=" * 72)
-    print(f"  SLIDING WALK-FORWARD — {n_folds} folds  "
+    print(f"  SLIDING WALK-FORWARD — {n_folds} folds  seed={seed}  "
           f"(train {CFG.sliding_train_years:g}y → val {CFG.sliding_val_months}m → "
           f"test {CFG.sliding_test_months}m, slide {CFG.sliding_step_months}m)")
-    print(f"  {total_timesteps:,} steps/fold × {n_folds} folds = "
-          f"~{total_timesteps * n_folds:,} env-steps total. envs={n_envs}.")
+    print(f"  <= {total_timesteps:,} steps/fold × {n_folds} folds"
+          f" (max_passes_per_fold={CFG.max_passes_per_fold}, early_stop_patience="
+          f"{CFG.early_stop_patience}). envs={n_envs}.")
     print("  Schedule (each row = retrain + 'live' test window):")
     for k, (tr, va, te) in enumerate(folds, start=1):
         print(f"    fold {k:>2}: train {tr.index.min().date()}→{tr.index.max().date()}"
@@ -988,19 +1114,25 @@ def train_sliding_walk_forward(
               f" | TEST {te.index.min().date()}→{te.index.max().date()} ({len(te):,} bars)")
     print("=" * 72)
 
+    if compare_baseline and baseline is None:
+        print("\n  Baseline on the same test windows"
+              f" ({'tuned per fold on train/val' if CFG.baseline_tune_per_fold else 'fixed default params'}):")
+        baseline = sliding_baseline(m1, feature_cols, folds)
+
     summary_rows: list[dict] = []
     test_equities: list[pd.DataFrame] = []
     test_trade_logs: list[pd.DataFrame] = []
 
     for k, (tr, va, te) in enumerate(folds, start=1):
         fold_dir = str(Path(out_dir) / "sliding" / f"fold_{k}")
-        eval_freq_k = max(25_000, total_timesteps // target_evals_per_fold)
+        fold_ts = cap_timesteps(total_timesteps, len(tr))
+        eval_freq_k = max(25_000, fold_ts // target_evals_per_fold)
         print(f"\n── Fold {k}/{n_folds}"
               f"  | train {len(tr):,}  val {len(va):,}  test {len(te):,} bars"
               f"  | TEST {te.index.min().date()}→{te.index.max().date()}  → {fold_dir}")
 
         train(
-            total_timesteps=total_timesteps,
+            total_timesteps=fold_ts,
             seed=seed,
             out_dir=fold_dir,
             train_episode_steps=train_episode_steps,
@@ -1021,7 +1153,7 @@ def train_sliding_walk_forward(
         if test_trades is not None and not test_trades.empty:
             test_trade_logs.append(test_trades)
 
-        summary_rows.append({
+        row = {
             "fold": k,
             "train_start": tr.index.min().date(), "train_end": tr.index.max().date(),
             "test_start": te.index.min().date(), "test_end": te.index.max().date(),
@@ -1034,28 +1166,31 @@ def train_sliding_walk_forward(
             "test_max_dd_pct": test_rep.get("max_drawdown_pct"),
             "test_avg_r": test_rep.get("avg_r"),
             "test_n_trades": test_rep.get("n_trades"),
-        })
+        }
+        if baseline is not None:
+            b = baseline[k - 1]["report"]
+            row.update({
+                "baseline_test_return_pct": b.get("total_return_pct"),
+                "baseline_test_sharpe": b.get("sharpe_like"),
+                "baseline_test_profit_factor": b.get("profit_factor"),
+                "baseline_test_max_dd_pct": b.get("max_drawdown_pct"),
+            })
+        summary_rows.append(row)
         print(f"   fold {k} TEST: return={test_rep.get('total_return_pct'):+.1f}%  "
               f"PF={test_rep.get('profit_factor'):.2f}  "
               f"Sharpe={test_rep.get('sharpe_like'):+.2f}  "
-              f"trades={test_rep.get('n_trades')}")
+              f"trades={test_rep.get('n_trades')}"
+              + (f"  | baseline {row['baseline_test_return_pct']:+.1f}%" if baseline is not None else ""))
 
     summary = pd.DataFrame(summary_rows)
     summary_path = Path(out_dir) / "sliding_walk_forward_summary.csv"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
     summary.to_csv(summary_path, index=False)
 
     # ── Stitch every fold's test window into one continuous OOS equity curve ──
-    running = CFG.initial_equity
-    parts = []
-    for eq in test_equities:
-        if eq is None or eq.empty or "equity" not in eq:
-            continue
-        s = eq["equity"].astype(float)
-        scaled = s / CFG.initial_equity * running          # chain (compound) folds
-        parts.append(scaled)
-        running = float(scaled.iloc[-1])
-    stitched = pd.concat(parts) if parts else pd.Series(dtype=float)
-    stitched_df = stitched.to_frame("equity")
+    # Note: the embargo bars at the start of each test window are not traded,
+    # so the stitched curve has short gaps between folds.
+    stitched_df = _stitch_equity(test_equities)
     stitched_path = Path(out_dir) / "sliding_oos_equity.csv"
     stitched_df.to_csv(stitched_path)
 
@@ -1068,6 +1203,8 @@ def train_sliding_walk_forward(
     print("=" * 72)
     show = ["fold", "test_start", "test_end", "test_return_pct", "test_sharpe",
             "test_profit_factor", "test_win_rate_pct", "test_max_dd_pct", "test_n_trades"]
+    if baseline is not None:
+        show.append("baseline_test_return_pct")
     print(summary[show].to_string(index=False))
 
     pos = int((summary["test_return_pct"] > 0).sum())
@@ -1080,6 +1217,31 @@ def train_sliding_walk_forward(
     print(f"    max drawdown : {oos.get('max_drawdown_pct'):+.1f}%")
     print(f"    profit factor: {oos.get('profit_factor'):.2f}   trades: {oos.get('n_trades')}")
     print(f"    curve → {stitched_path}")
+
+    base_oos = None
+    if baseline is not None:
+        base_eq = _stitch_equity([b["equity"] for b in baseline])
+        base_eq.to_csv(Path(out_dir) / "sliding_oos_equity_baseline.csv")
+        base_trade_logs = [b["trades"] for b in baseline if b["trades"] is not None and not b["trades"].empty]
+        base_trades = pd.concat(base_trade_logs, ignore_index=True) if base_trade_logs else pd.DataFrame()
+        base_oos = full_report(base_eq, base_trades, initial_equity=CFG.initial_equity,
+                               periods_per_year=CFG.periods_per_year)["value"].to_dict()
+        print("\n  STITCHED baseline on the same windows:")
+        print(f"    total return : {base_oos.get('total_return_pct'):+.1f}%   "
+              f"Sharpe-like {base_oos.get('sharpe_like'):+.2f}   "
+              f"max DD {base_oos.get('max_drawdown_pct'):+.1f}%   "
+              f"PF {base_oos.get('profit_factor'):.2f}")
+
+        sig = _significance_report(stitched_df, all_trades, base_eq, base_trades, summary)
+        sig_path = Path(out_dir) / "sliding_significance.csv"
+        sig.to_csv(sig_path, index=False)
+        print(f"\n  Bootstrap significance ({CFG.bootstrap_samples:,} resamples, one-sided vs 0):")
+        cols = [c for c in ("test", "n", "stat", "ci_lo", "ci_hi", "p_value", "wins", "sign_p_value")
+                if c in sig]
+        print(sig[cols].to_string(index=False))
+        print("    Paired fold tests resample only n_folds values — with few folds the "
+              "bootstrap CI is\n    over-confident; weigh the exact sign test (wins, sign_p_value) as well.")
+        print(f"    → {sig_path}")
 
     # ── Deployment gate on the TEST windows ──────────────────────────────────
     passed, detail = _passes_consistency_gate(
@@ -1094,7 +1256,64 @@ def train_sliding_walk_forward(
 
     print(f"\n  Per-fold summary → {summary_path}")
     print("=" * 72)
+    summary.attrs["oos"] = oos
+    summary.attrs["baseline_oos"] = base_oos
+    summary.attrs["gate_passed"] = passed
     return summary
+
+
+def train_multi_seed(
+    seeds: tuple[int, ...] | None = None,
+    out_dir: str = "models/multi_seed",
+    **sliding_kwargs,
+) -> pd.DataFrame:
+    """Repeat the sliding walk-forward for several seeds to measure how much of
+    the result is seed luck.  Data and the (deterministic) baseline are computed
+    once and shared.  Each seed writes to ``out_dir/seed_<s>``; the aggregate
+    goes to ``multi_seed_folds.csv`` (per fold, mean/std across seeds) and
+    ``multi_seed_oos.csv`` (stitched OOS metrics per seed)."""
+    seeds = tuple(seeds or CFG.multi_seeds)
+    m1, feature_cols, folds = _load_sliding_folds()
+    baseline = None
+    if sliding_kwargs.get("compare_baseline", True):
+        print("Baseline on the sliding test windows (shared by all seeds):")
+        baseline = sliding_baseline(m1, feature_cols, folds)
+
+    per_seed, oos_rows = [], []
+    for s in seeds:
+        summ = train_sliding_walk_forward(seed=s, out_dir=str(Path(out_dir) / f"seed_{s}"),
+                                          data=(m1, feature_cols, folds), baseline=baseline,
+                                          **sliding_kwargs)
+        per_seed.append(summ.assign(seed=s))
+        oos = summ.attrs.get("oos") or {}
+        oos_rows.append({"seed": s, "gate_passed": summ.attrs.get("gate_passed"),
+                         **{f"oos_{k}": v for k, v in oos.items()}})
+
+    allf = pd.concat(per_seed, ignore_index=True)
+    metrics = ["test_return_pct", "test_sharpe", "test_profit_factor", "test_max_dd_pct"]
+    fold_agg = allf.groupby("fold")[metrics].agg(["mean", "std", "min", "max"])
+    fold_agg.columns = [f"{m}_{a}" for m, a in fold_agg.columns]
+    fold_agg["seeds_positive"] = allf.groupby("fold")["test_return_pct"].apply(lambda x: int((x > 0).sum()))
+    oos_df = pd.DataFrame(oos_rows)
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    allf.to_csv(Path(out_dir) / "multi_seed_all_folds.csv", index=False)
+    fold_agg.to_csv(Path(out_dir) / "multi_seed_folds.csv")
+    oos_df.to_csv(Path(out_dir) / "multi_seed_oos.csv", index=False)
+
+    print("\n" + "=" * 72)
+    print(f"  MULTI-SEED SUMMARY — seeds {list(seeds)}")
+    print("=" * 72)
+    cols = [c for c in ("seed", "gate_passed", "oos_total_return_pct", "oos_sharpe_like",
+                        "oos_max_drawdown_pct", "oos_profit_factor") if c in oos_df]
+    print(oos_df[cols].to_string(index=False))
+    if "oos_total_return_pct" in oos_df:
+        r = oos_df["oos_total_return_pct"]
+        print(f"\n  Stitched OOS return across seeds: mean {r.mean():+.1f}%  std {r.std():.1f}  "
+              f"min {r.min():+.1f}%  max {r.max():+.1f}%  positive {int((r > 0).sum())}/{len(r)}")
+    print(f"  Per-fold seed spread → {Path(out_dir) / 'multi_seed_folds.csv'}")
+    print("=" * 72)
+    return oos_df
 
 
 if __name__ == "__main__":
@@ -1102,4 +1321,8 @@ if __name__ == "__main__":
     # simulation; stitches a continuous out-of-sample test track record).
     # For the block-fold scheme call train_walk_forward(); for a single
     # chronological split call train() directly.
-    train_sliding_walk_forward()
+    # `python train_ppo.py --multi-seed` repeats it for CFG.multi_seeds.
+    if "--multi-seed" in sys.argv[1:]:
+        train_multi_seed()
+    else:
+        train_sliding_walk_forward()
