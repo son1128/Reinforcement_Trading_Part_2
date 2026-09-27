@@ -20,7 +20,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from model_artifacts import load_run_info, resolve_project_path, resolve_sb3_model_path
+from model_artifacts import (
+    assert_holdout_is_unseen,
+    load_run_info,
+    resolve_project_path,
+    resolve_sb3_model_path,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +362,7 @@ def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> No
     print("-" * 50)
 
     model_path: Path | None = None
+    run_info: dict | None = None
     vecnorm_path = models_path / "vec_normalize.pkl"
     try:
         _, run_info = load_run_info(models_path)
@@ -400,6 +406,7 @@ def run_diagnostics(models_dir: str = "models", reveal_test: bool = False) -> No
 
         split_frames = [("train", train_feat), ("val", val_feat)]
         if reveal_test:
+            assert_holdout_is_unseen(run_info or {}, test_feat.index.min())
             split_frames.append(("test", test_feat))
         else:
             print("  Test split remains sealed. Re-run with reveal_test=True for final holdout diagnostics.")

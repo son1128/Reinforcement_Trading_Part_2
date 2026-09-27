@@ -80,6 +80,7 @@ class BracketTradingEnv(gym.Env):
         # sorted DatetimeIndex for O(log n) searchsorted lookups.
         # This replaces the O(n) boolean-mask scan on every step — with 1.5 M
         # M1 bars the speedup is ~100-200x per step.
+        self._m1_open  = self.m1_df["Open"].to_numpy(dtype=np.float64)
         self._m1_high  = self.m1_df["High"].to_numpy(dtype=np.float64)
         self._m1_low   = self.m1_df["Low"].to_numpy(dtype=np.float64)
         self._m1_index = self.m1_df.index  # DatetimeIndex (sorted, tz-aware)
@@ -187,7 +188,8 @@ class BracketTradingEnv(gym.Env):
             bars_in_trade=0,
         )
 
-    def _close_position(self, exit_price_raw: float, exit_time: pd.Timestamp, reason: str) -> float:
+    def _close_position(self, exit_price_raw: float, exit_time: pd.Timestamp, reason: str,
+                        gap_fill: bool = False) -> float:
         p = self.position
         if p.direction == 0:
             return 0.0
@@ -211,6 +213,7 @@ class BracketTradingEnv(gym.Env):
             "r_mult": r_mult,                # realized R-multiple (actual outcome)
             "bars_in_trade": p.bars_in_trade,
             "exit_reason": reason,
+            "gap_fill": gap_fill,            # SL filled at a gapped-through open
         })
         self.position = Position()
         return pnl
@@ -235,11 +238,20 @@ class BracketTradingEnv(gym.Env):
 
         realized = 0.0
         for idx in range(lo, hi):
+            open_ = self._m1_open[idx]
             high = self._m1_high[idx]
             low  = self._m1_low[idx]
             p = self.position
             if p.direction == 0:
                 break
+
+            # Gap-through stop: if the bar OPENS beyond the SL (weekend / news
+            # gap), a stop order fills at the open, not at the SL price.
+            # A TP gap is left at the TP price (no price improvement assumed).
+            if (open_ - p.sl) * p.direction <= 0:
+                realized += self._close_position(open_, self._m1_index[idx], "SL", gap_fill=True)
+                break
+
             if p.direction == 1:
                 sl_hit = low  <= p.sl
                 tp_hit = high >= p.tp
