@@ -78,6 +78,7 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 - **Equity is mark-to-market:** `equity` = realized + unrealized PnL at the end of each decision interval (`realized_equity` keeps the old series), so max drawdown includes open-trade losses. Evaluation episodes liquidate any open position at the end (`exit_reason="episode_end"`); training episodes (random fixed-length windows) do not. The MTM reward-shaping term also uses the interval-end close instead of the stale decision close.
 - **Over-training controls:** `max_passes_per_fold` caps each fold's timesteps at N passes over its train bars (off by default), and `early_stop_patience` stops a run after that many evaluations without a new best eligible checkpoint (never before `early_stop_min_evals`).
 - **Baseline + significance:** the sliding walk-forward also runs the trend baseline on every fold's test window (params tuned on that fold's own train/val when `baseline_tune_per_fold=True`), writes `sliding_oos_equity_baseline.csv`, and bootstrap-tests the results (`sliding_significance.csv`, `significance.py`): mean trade R > 0, daily Sharpe > 0 (moving-block bootstrap), and RL − baseline per fold (bootstrap + exact sign test).
+- **Checkpoint-selection `dd_penalty`:** set in `config.py` (`dd_penalty`); `None` (default) = `1 / (100 · risk_fraction)` = 2.0 at 0.5% risk, i.e. 1% of equity drawdown = 2R, so drawdown R and return R weigh the same. To choose it from data, run the sliding walk-forward with `log_checkpoint_test = True` (each checkpoint evaluation also logs the fold's test window, record-only — never used for selection; early stopping is disabled for that run), then `python calibrate_dd_penalty.py`: it replays checkpoint selection (score, eligibility, early stopping) for each candidate, picks the value on the earliest folds and reports it against the default on the later folds.
 - **Multi-seed:** `train_ppo.train_multi_seed()` repeats the sliding walk-forward for `multi_seeds`, sharing data and the baseline, and reports the per-fold and stitched-OOS spread across seeds.
 - Position size is fixed-fractional risk-based; the RL agent controls direction and bracket shape, not size.
 - `run_pipeline.py` now performs a temporal train/validation/test split, tunes on train/val, and keeps test sealed by default.
@@ -94,6 +95,7 @@ notebooks/XAUUSD_RL_Pipeline_Demo.ipynb
 - `baselines.py`: random and EMA/ATR rule policies.
 - `evaluate.py`: metrics, trade-log summary, drawdown.
 - `significance.py`: bootstrap / sign tests for out-of-sample results.
+- `calibrate_dd_penalty.py`: offline re-scoring of checkpoint logs to choose `dd_penalty`.
 - `visualize.py`: Plotly visualization functions.
 - `train_ppo.py`: optional PPO training scaffold.
 - `run_pipeline.py`: one-command pre-test pipeline with validation-only outputs.

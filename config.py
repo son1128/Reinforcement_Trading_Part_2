@@ -185,6 +185,18 @@ class ProjectConfig:
     early_stop_patience: Optional[int] = 6
     early_stop_min_evals: int = 8
 
+    # ── Checkpoint selection ─────────────────────────────────────────────────
+    # dd_penalty = reward-units subtracted per 1% max drawdown when scoring a
+    # checkpoint.  None → 1 / (100 · risk_fraction) (= 2.0 at 0.5% risk): 1% of
+    # equity is that many R, so drawdown R and return R weigh the same.
+    # Set a number to override; calibrate_dd_penalty.py picks one from data.
+    dd_penalty: Optional[float] = None
+    # Record-only: log each checkpoint's metrics on the sliding fold's TEST
+    # window (never used for selection) so calibrate_dd_penalty.py can re-score
+    # other dd_penalty values offline.  Costs one extra rollout per evaluation
+    # and disables early stopping for the run.
+    log_checkpoint_test: bool = False
+
     # ── Robustness / significance ────────────────────────────────────────────
     multi_seeds: Tuple[int, ...] = (42, 7, 123)   # train_ppo.train_multi_seed()
     # Sliding walk-forward also runs the rule-based trend baseline on every
@@ -242,6 +254,12 @@ class ProjectConfig:
         if "_ask_" in name:
             return "ask"
         return "mid"
+
+    @property
+    def resolved_dd_penalty(self) -> float:
+        if self.dd_penalty is not None:
+            return float(self.dd_penalty)
+        return 1.0 / (100.0 * self.risk_fraction)
 
     def env_kwargs(self) -> dict:
         """Account / execution kwargs shared by every BracketTradingEnv."""
